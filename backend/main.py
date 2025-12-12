@@ -20,16 +20,13 @@ app = FastAPI(title="Resume Parser API")
 # ----------------------------
 # CORS CONFIGURATION
 # ----------------------------
-DEFAULT_FRONTEND = "https://resume-parser-eosin.vercel.app"
-
-FRONTEND_URL = os.environ.get("FRONTEND_URL", DEFAULT_FRONTEND)
-
-# Allow localhost for testing + production Vercel frontend
 allowed_origins = [
-    FRONTEND_URL,
+    "https://resume-parser-eosin.vercel.app",   # Your Vercel frontend
+    "https://resumeparser-backend.up.railway.app",  # Backend itself
     "http://localhost:3000",
     "http://localhost:5173",
     "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
 ]
 
 app.add_middleware(
