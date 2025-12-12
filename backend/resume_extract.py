@@ -1,19 +1,17 @@
 # backend/resume_extract.py
+
 from io import BytesIO
 import os
 import json
 import time
 import re
+from collections import OrderedDict
 
 import pdfplumber
 from docx import Document
 import requests
 
-# Do NOT call load_dotenv() in production; Railway / Railway variables populate os.environ.
-# If you test locally and want to load a .env file, uncomment the next two lines and keep .env in .gitignore:
-# from dotenv import load_dotenv
-# load_dotenv()
-
+# GEMINI KEY PROVIDED FROM ENV (Railway)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 GEMINI_MODEL = "gemini-2.5-flash"
@@ -23,6 +21,9 @@ GEMINI_URL = (
 )
 
 
+# ---------------------------
+# FILE EXTRACTION
+# ---------------------------
 def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
     """Extract raw text from PDF, DOCX, or plain text."""
     filename = (filename or "").lower()
@@ -35,7 +36,6 @@ def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
                     page_text = page.extract_text() or ""
                     text += page_text + "\n"
         except Exception as e:
-            # If pdfplumber fails, fall back to plain text decode
             print("pdfplumber error:", e)
             try:
                 return file_bytes.decode("utf-8", errors="ignore")
@@ -61,6 +61,9 @@ def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
         return ""
 
 
+# ---------------------------
+# SAFE JSON EXTRACTION HELPERS
+# ---------------------------
 def _extract_json_from_text(maybe_text: str) -> str:
     """Return the first {...} substring from maybe_text (or raise)."""
     if not maybe_text:
@@ -74,37 +77,34 @@ def _extract_json_from_text(maybe_text: str) -> str:
 
 
 def _safe_parse_json_block(maybe_text: str) -> dict:
-    """
-    Try to find and parse first JSON object inside maybe_text.
-    Returns parsed dict or raises RuntimeError with helpful content.
-    """
+    """Try strict JSON parse; raise detailed error on failure."""
     cleaned = maybe_text.strip()
-    # Remove surrounding markdown code fences like ```json ... ```
+    # remove ```json fences
     if cleaned.startswith("```"):
         cleaned = cleaned.strip("`")
         cleaned = cleaned.replace("json", "", 1).strip()
 
-    # Now extract {...}
     json_str = _extract_json_from_text(cleaned)
 
     try:
         return json.loads(json_str)
     except json.JSONDecodeError as e:
-        # Provide the raw JSON substring when failing for easier debugging
-        raise RuntimeError(f"JSON decode error: {e}\nRaw JSON substring: {json_str}") from e
+        raise RuntimeError(
+            f"JSON decode error: {e}\nRaw JSON substring: {json_str}"
+        ) from e
 
 
+# ---------------------------
+# GEMINI CALL WITH RETRIES
+# ---------------------------
 def _call_gemini_with_retries(prompt: str, attempts: int = 3, backoff: float = 1.0) -> dict:
-    """Call the Gemini API with retries and return parsed JSON response (not final parsed object)."""
     if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY environment variable is not set. Set GEMINI_API_KEY in Railway / env.")
+        raise RuntimeError("GEMINI_API_KEY is not set!")
 
     body = {
         "contents": [
             {
-                "parts": [
-                    {"text": prompt}
-                ]
+                "parts": [{"text": prompt}]
             }
         ]
     }
@@ -115,61 +115,158 @@ def _call_gemini_with_retries(prompt: str, attempts: int = 3, backoff: float = 1
     }
 
     last_exception = None
+
     for attempt in range(1, attempts + 1):
         try:
             resp = requests.post(
-                GEMINI_URL,
-                headers=headers,
-                data=json.dumps(body),
-                timeout=60,
+                GEMINI_URL, headers=headers, data=json.dumps(body), timeout=60
             )
-            # If status is not 2xx, raise for status to handle in except below
             resp.raise_for_status()
-            # Return full parsed JSON body (may contain nested text parts we handle later)
-            try:
-                return resp.json()
-            except Exception as e:
-                # If resp.json() fails, raise useful information
-                text = resp.text
-                raise RuntimeError(f"Failed to decode JSON response from Gemini: {e}\nRaw text: {text}") from e
+            return resp.json()
 
         except Exception as e:
             last_exception = e
-            # Print helpful debug info for logs; include response text if available
             try:
-                resp_text = resp.text if 'resp' in locals() and resp is not None else "<no response text>"
-            except Exception:
-                resp_text = "<error reading response text>"
-            print(f"Gemini call attempt {attempt} failed: {repr(e)}; response_text_snippet={resp_text[:1000]}")
+                print(
+                    f"Gemini call attempt {attempt} failed: {repr(e)}; response_text_snippet="
+                    f"{resp.text[:500] if 'resp' in locals() and resp is not None else ''}"
+                )
+            except:
+                pass
+
             if attempt < attempts:
                 time.sleep(backoff * attempt)
-            else:
-                # All attempts failed
-                raise RuntimeError(f"Gemini call failed after {attempts} attempts: {last_exception}") from last_exception
+
+    raise RuntimeError(f"Gemini call failed after {attempts} attempts: {last_exception}")
 
 
+# ---------------------------
+# TOLERANT PARSER FOR BROKEN JSON
+# ---------------------------
+def _extract_list_from_brackets(text, key_name):
+    """
+    Extract ["list","like","this"] inside key_name : [ ... ] even if malformed.
+    """
+    pattern = re.compile(
+        rf'"{re.escape(key_name)}"\s*:\s*\[([^\]]*)\]',
+        re.IGNORECASE | re.DOTALL,
+    )
+    m = pattern.search(text)
+    if not m:
+        return []
+
+    inner = m.group(1)
+
+    # get quoted strings
+    items = re.findall(r'"([^"]+)"', inner)
+
+    # fallback: split on commas
+    if not items:
+        tokens = [t.strip() for t in inner.split(",") if t.strip()]
+        items = [t.strip('" ').strip() for t in tokens if t.strip()]
+
+    # remove duplicates while preserving order
+    return list(OrderedDict.fromkeys(items))
+
+
+def _extract_string_field(text, key_name):
+    """Extract "key": "value" pattern."""
+    pattern = re.compile(rf'"{re.escape(key_name)}"\s*:\s*"([^"]+)"', re.IGNORECASE)
+    m = pattern.search(text)
+    return m.group(1).strip() if m else None
+
+
+def tolerant_parse_raw_text(raw_text: str, resume_text: str) -> dict:
+    """
+    Best-effort extraction for badly formatted Gemini output.
+    Returns dict shaped like your expected parsed result.
+    """
+
+    parsed = {
+        "full_name": None,
+        "email": None,
+        "phone": None,
+        "total_experience_years": None,
+        "current_role": None,
+        "current_company": None,
+        "location": None,
+        "skills": [],
+        "education": [],
+        "experience": [],
+    }
+
+    # full name
+    parsed["full_name"] = _extract_string_field(raw_text, "full_name")
+    if not parsed["full_name"]:
+        # fallback: first non-empty line of resume
+        for line in resume_text.splitlines():
+            if line.strip():
+                parsed["full_name"] = line.strip()
+                break
+
+    # email
+    email_m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", raw_text)
+    if not email_m:
+        email_m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", resume_text)
+    parsed["email"] = email_m.group(0) if email_m else None
+
+    # phone
+    phone_m = re.search(r"(\+?\d[\d\-\s]{6,}\d)", raw_text)
+    if not phone_m:
+        phone_m = re.search(r"(\+?\d[\d\-\s]{6,}\d)", resume_text)
+    parsed["phone"] = phone_m.group(1) if phone_m else None
+
+    # skills
+    parsed["skills"] = _extract_list_from_brackets(raw_text, "skills")
+
+    # experience years
+    exp_m = re.search(r'"total_experience_years"\s*:\s*([0-9]+(?:\.[0-9]+)?)', raw_text)
+    if exp_m:
+        parsed["total_experience_years"] = float(exp_m.group(1))
+
+    # simple fields
+    for field in ["current_role", "current_company", "location"]:
+        parsed[field] = _extract_string_field(raw_text, field)
+
+    # education extraction (basic)
+    edu_pattern = re.compile(
+        r'"degree"\s*:\s*"([^"]+)"\s*,\s*"institute"\s*:\s*"([^"]+)"',
+        re.IGNORECASE,
+    )
+    edu_list = []
+    for degree, institute in edu_pattern.findall(raw_text):
+        edu_list.append({
+            "degree": degree,
+            "institute": institute,
+            "start_year": None,
+            "end_year": None,
+        })
+    parsed["education"] = edu_list
+
+    return parsed
+
+
+# ---------------------------
+# MAIN GEMINI PARSER
+# ---------------------------
 def parse_resume_with_gemini(resume_text: str) -> dict:
-    """
-    Call Gemini and return a parsed JSON dict with resume fields.
-    This function is defensive: it prints diagnostics and raises informative errors.
-    """
+    """Call Gemini → extract JSON → tolerant parse fallback."""
+
     prompt = f"""
 You are a resume parsing engine.
 
-Extract the following fields from the resume text and return ONLY a valid JSON object:
+Extract the following fields and return ONLY a valid JSON object:
 
-- full_name (string)
-- email (string)
-- phone (string)
-- total_experience_years (number, approximate)
-- current_role (string or null)
-- current_company (string or null)
-- location (string or null)
-- skills (array of strings)
-- education (array of objects: degree, institute, start_year, end_year)
-- experience (array of objects: job_title, company, start_date, end_date, description)
-
-If any field is missing, use null or empty array.
+- full_name
+- email
+- phone
+- total_experience_years
+- current_role
+- current_company
+- location
+- skills (array)
+- education (list of objects)
+- experience (list of objects)
 
 Resume text:
 \"\"\"{resume_text}\"\"\"
@@ -178,79 +275,75 @@ Resume text:
     # Call Gemini
     data = _call_gemini_with_retries(prompt)
 
-    # The exact response shape may vary. Attempt to get text parts safely.
-    # Older code expected data["candidates"][0]["content"]["parts"]
-    text_candidates = None
-    try:
-        if isinstance(data, dict) and "candidates" in data:
-            # keep backward compatibility
-            cand = data.get("candidates") or []
-            if cand:
-                content = cand[0].get("content") or {}
-                parts = content.get("parts") or []
-                text_candidates = "\n".join(p.get("text", "") for p in parts if "text" in p).strip()
-    except Exception as e:
-        print("Error extracting candidates parts:", e)
+    # extract text content
+    text_content = None
 
-    if not text_candidates:
-        # Try other common keys (best-effort)
+    if "candidates" in data:
         try:
-            if isinstance(data, dict) and "outputs" in data:
-                outputs = data.get("outputs") or []
-                # outputs might contain ['content']['text'] or similar
-                for out in outputs:
-                    if isinstance(out, dict):
-                        content = out.get("content") or {}
-                        if isinstance(content, dict):
-                            # try nested parts
-                            parts = content.get("parts") or []
-                            if parts:
-                                text_candidates = "\n".join(p.get("text", "") for p in parts if "text" in p).strip()
-                            elif "text" in content:
-                                text_candidates = content.get("text", "").strip()
-        except Exception as e:
-            print("Error extracting outputs parts:", e)
+            content = data["candidates"][0]["content"]
+            parts = content.get("parts") or []
+            text_content = "\n".join(
+                p.get("text", "") for p in parts if "text" in p
+            ).strip()
+        except:
+            pass
 
-    # If still empty, attempt to stringify top-level keys for debug
-    if not text_candidates:
-        print("Gemini raw response (full):", json.dumps(data)[:2000])
-        raise RuntimeError(f"No textual candidate parts found in Gemini response. See logs for raw response.")
+    if not text_content and "outputs" in data:
+        try:
+            for out in data["outputs"]:
+                content = out.get("content", {})
+                if isinstance(content, dict):
+                    parts = content.get("parts") or []
+                    if parts:
+                        text_content = "\n".join(
+                            p.get("text", "") for p in parts if "text" in p
+                        ).strip()
+                    elif "text" in content:
+                        text_content = content["text"].strip()
+        except:
+            pass
 
-    # Now we have a textual block (likely containing JSON). Try to extract JSON object.
-    raw_text = text_candidates
+    if not text_content:
+        raise RuntimeError("Gemini returned no textual response.")
+
+    raw_text = text_content
+
+    # TRY STRICT JSON
     try:
         parsed = _safe_parse_json_block(raw_text)
-        # final sanity: ensure keys exist (but do not enforce strict typing)
-        if not isinstance(parsed, dict):
-            raise RuntimeError("Parsed Gemini output is not a JSON object/dict.")
         return parsed
-    except Exception as e:
-        # Log the raw_text for debugging and show helpful error
-        print("Failed to parse JSON from Gemini raw_text snippet:", raw_text[:2000])
-        raise RuntimeError(f"Failed to parse JSON from Gemini response: {e}") from e
+    except Exception as strict_err:
+        print("Strict JSON parse failed:", strict_err)
+        print("Using tolerant parser...")
+
+    # TOLERANT PARSE
+    try:
+        fallback_parsed = tolerant_parse_raw_text(raw_text, resume_text)
+        print("Tolerant parser succeeded.")
+        return fallback_parsed
+    except Exception as tolerant_err:
+        print("Tolerant parser failed:", tolerant_err)
+
+    # ULTIMATE FALLBACK
+    print("Using ultimate fallback parser.")
+    return fallback_parse_text(resume_text)
 
 
-# --- Small fallback parser if Gemini is unavailable (VERY simple) ---
+# ---------------------------
+# VERY SIMPLE FALLBACK PARSER
+# ---------------------------
 _email_re = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _phone_re = re.compile(r"(\+?\d[\d\-\s]{6,}\d)")
 
 def fallback_parse_text(resume_text: str) -> dict:
-    """
-    Extremely simple fallback parser to extract a couple of fields.
-    Use this only for testing / graceful degradation.
-    """
+    """Minimal parser—guaranteed not to fail."""
     emails = _email_re.findall(resume_text) or []
     phones = _phone_re.findall(resume_text) or []
-    # rough "name" heuristic: first non-empty line
-    first_line = ""
-    for line in resume_text.splitlines():
-        l = line.strip()
-        if l:
-            first_line = l
-            break
+
+    first_line = next((l.strip() for l in resume_text.splitlines() if l.strip()), None)
 
     return {
-        "full_name": first_line or None,
+        "full_name": first_line,
         "email": emails[0] if emails else None,
         "phone": phones[0] if phones else None,
         "total_experience_years": None,
@@ -259,5 +352,5 @@ def fallback_parse_text(resume_text: str) -> dict:
         "location": None,
         "skills": [],
         "education": [],
-        "experience": []
+        "experience": [],
     }
